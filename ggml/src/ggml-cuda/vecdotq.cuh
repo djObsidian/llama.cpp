@@ -815,6 +815,17 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __
     const block_ptq1_0 * bq                 = (const block_ptq1_0 *) vbq + kbx;
     int                  sumi[ncols_dst][4] = {};
 
+    // sum((d - 1) * u) == sum(d * u) - sum(u), so the ternary -1 offset does not have to bias
+    // every unpacked quad with an (emulated) __vsub4: the ones-term can be accumulated with a
+    // native DP4A against the activation word that is already loaded, and applied once per
+    // 32-element q8_1 chunk. All arithmetic stays in int32 and cannot overflow (32*2*127 per
+    // chunk), so this is bit-identical to the biased form.
+    // The __vsub4 is paid once per quad while the ones-term is paid once per quad PER COLUMN,
+    // so this only pays off for a single destination column - which is the decode path. With
+    // more columns the biased form is kept, making the change strictly no-worse.
+    constexpr bool       fold_offset        = (ncols_dst == 1);
+    int                  sumu[ncols_dst][4] = {};
+
     // Widen four bytes to 16-bit lanes so multiply-by-three cannot carry between bytes.
 #    pragma unroll
     for (int g = 0; g < 4; ++g) {
@@ -829,12 +840,16 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __
             v_lo                = w_lo & 0x00FF00FF;
             v_hi                = w_hi & 0x00FF00FF;
 
-            const int q = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+            const int q = fold_offset ? __byte_perm(w_lo, w_hi, 0x7531)                      // {0,1,2}
+                                      : __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
             const int e = t * 16 + 4 * g;
 #    pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
                 const int u     = get_int_b4(bq8_1[j * stride_col_y + iqs + (e >> 5)].qs, (e & 31) >> 2);
                 sumi[j][e >> 5] = ggml_cuda_dp4a(q, u, sumi[j][e >> 5]);
+                if constexpr (fold_offset) {
+                    sumu[j][e >> 5] = ggml_cuda_dp4a(0x01010101, u, sumu[j][e >> 5]);
+                }
             }
         }
     }
@@ -852,12 +867,16 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __
             v_lo                = w_lo & 0x00FF00FF;
             v_hi                = w_hi & 0x00FF00FF;
 
-            const int q = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+            const int q = fold_offset ? __byte_perm(w_lo, w_hi, 0x7531)                      // {0,1,2}
+                                      : __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
             const int e = 80 + t * 8 + 4 * g;
 #    pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
                 const int u     = get_int_b4(bq8_1[j * stride_col_y + iqs + (e >> 5)].qs, (e & 31) >> 2);
                 sumi[j][e >> 5] = ggml_cuda_dp4a(q, u, sumi[j][e >> 5]);
+                if constexpr (fold_offset) {
+                    sumu[j][e >> 5] = ggml_cuda_dp4a(0x01010101, u, sumu[j][e >> 5]);
+                }
             }
         }
     }
@@ -870,11 +889,15 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __
         const uint32_t w1 = v * 3;
         v                 = w1 & 0x00FF00FF;
 
-        const int q = __vsub4(__byte_perm(w0, w1, 0x7531), 0x01010101);
+        const int q = fold_offset ? __byte_perm(w0, w1, 0x7531)                      // {0,1,2}
+                                  : __vsub4(__byte_perm(w0, w1, 0x7531), 0x01010101);
 #    pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
             const int u = get_int_b4(bq8_1[j * stride_col_y + iqs + 3].qs, 6 + t / 2);
             sumi[j][3]  = ggml_cuda_dp4a(q, u, sumi[j][3]);
+            if constexpr (fold_offset) {
+                sumu[j][3] = ggml_cuda_dp4a(0x01010101, u, sumu[j][3]);
+            }
         }
     }
 
@@ -884,7 +907,8 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __
         float acc = 0.0f;
 #    pragma unroll
         for (int k = 0; k < 4; ++k) {
-            acc += __low2float(bq8_1[j * stride_col_y + iqs + k].ds) * (float) sumi[j][k];
+            acc += __low2float(bq8_1[j * stride_col_y + iqs + k].ds) *
+                   (float) (fold_offset ? sumi[j][k] - sumu[j][k] : sumi[j][k]);
         }
         result[j] = d * acc;
     }
