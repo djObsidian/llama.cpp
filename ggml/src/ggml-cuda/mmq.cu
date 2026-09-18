@@ -373,7 +373,13 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     switch (type) {
 #if !defined(GGML_USE_HIP)
         case GGML_TYPE_PTQ1_0:
-            mmq_supported = turing_mma_available(cc);
+            // NEGATIVE RESULT (see commit message): the PTQ1_0 MMQ tile path has a complete
+            // DP4A variant, so this gate is not a missing-kernel gate. Letting sm_70 take it
+            // is correct but 2.3x slower than the fp16-dequantize + cuBLAS fallback, because
+            // Volta has no int8 tensor cores and strong fp16 ones. Kept for documentation.
+            mmq_supported = turing_mma_available(cc) ||
+                            (GGML_CUDA_CC_IS_NVIDIA(cc) &&
+                             ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_DP4A);
             break;
 #endif
         case GGML_TYPE_Q1_0:
